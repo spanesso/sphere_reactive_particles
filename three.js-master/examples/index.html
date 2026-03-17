@@ -5,18 +5,49 @@
 		<meta charset="utf-8">
 		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
 		<link type="text/css" rel="stylesheet" href="example.css">
+
+		<!-- /CAMBIO/ Fullscreen override styles -->
+		<style>
+			html {
+				width: 100%;
+				height: 100%;
+				overflow: hidden;
+			}
+			body {
+				margin: 0;
+				padding: 0;
+				width: 100%;
+				height: 100%;
+				overflow: hidden;
+				background: #000;
+			}
+			canvas {
+				display: block;
+				width: 100% !important;
+				height: 100% !important;
+				position: fixed;
+				top: 0;
+				left: 0;
+			}
+			/* /CAMBIO/ Hide info overlay for fullscreen immersive experience */
+			#info {
+				display: none;
+			}
+		</style>
 	</head>
 	<body>
 
 		<div id="info">
 			<a href="https://threejs.org/" target="_blank" rel="noopener" class="logo-link"></a>
-
 			<div class="title-wrapper">
 				<a href="https://threejs.org/" target="_blank" rel="noopener">three.js</a><span>Fluid Particles</span>
 			</div>
-
 			<small>MLS-MPM particle simulation running in compute shaders.</small>
 		</div>
+
+		<!-- /CAMBIO/ Leap Motion library - non-module script, loaded before the ES module -->
+		<!-- Copied from /ninja-uribe/js/leap-1.1.1.js following the ninja-uribe integration pattern -->
+		<script src="js/leap-1.1.1.js"></script>
 
 		<script type="importmap">
 			{
@@ -61,6 +92,56 @@
 			const mouseCoord = new THREE.Vector3();
 			const prevMouseCoord = new THREE.Vector3();
 			let mouseRayOriginUniform, mouseRayDirectionUniform, mouseForceUniform;
+
+			// ─── /CAMBIO/ ColorTupla structure ────────────────────────────────────────────
+			// A pair of hex colors (colorA / colorB) that a group alternates between on bass hit
+			const ColorTupla = ( colorA, colorB ) => ({
+				colorA: new THREE.Color( colorA ),
+				colorB: new THREE.Color( colorB ),
+			});
+
+			// /CAMBIO/ Palette pool – 12 tuplas, enough variety for many rotation cycles
+			const colorPalettes = [
+				ColorTupla( '#FF3366', '#0033FF' ),  //  0
+				ColorTupla( '#FF6600', '#0099FF' ),  //  1
+				ColorTupla( '#FFCC00', '#6600FF' ),  //  2
+				ColorTupla( '#00FF99', '#FF0066' ),  //  3
+				ColorTupla( '#00CCFF', '#FF3300' ),  //  4
+				ColorTupla( '#FF00CC', '#00FFCC' ),  //  5
+				ColorTupla( '#FFFF00', '#0000FF' ),  //  6
+				ColorTupla( '#FF0000', '#00FFFF' ),  //  7
+				ColorTupla( '#00FF00', '#FF00FF' ),  //  8
+				ColorTupla( '#FF6699', '#3366FF' ),  //  9
+				ColorTupla( '#66FF33', '#FF3366' ),  // 10
+				ColorTupla( '#33CCFF', '#FF6600' ),  // 11
+			];
+
+			// /CAMBIO/ Each group starts on a different palette (indices 0,3,6,9 – spread across the palette pool)
+			const groupPaletteIndex = [ 0, 3, 6, 9 ];
+
+			// /CAMBIO/ Active color state per group: 0 = colorA, 1 = colorB
+			const groupActiveColor = [ 0, 0, 0, 0 ];
+
+			// /CAMBIO/ Four vec3 uniforms – one per group – written by JS, read by the vertex shader
+			let colorGroup0, colorGroup1, colorGroup2, colorGroup3;
+			let groupColorUniforms = [];   // populated in setupMesh()
+
+			// ─── /CAMBIO/ Audio reactive variables ────────────────────────────────────────
+			let audioContext = null;
+			let analyser    = null;
+			let audioDataArray = null;
+			let smoothedBass   = 0;
+			const BASS_THRESHOLD   = 80;   // out of 255; raise to reduce sensitivity
+			const BASS_SMOOTH      = 0.85; // 0 = no smoothing, 1 = never changes
+			let bassWasActive = false;
+
+			// ─── /CAMBIO/ Leap Motion variables ───────────────────────────────────────────
+			let leapController   = null;
+			let leapHandVisible  = false;  // true while Leap detects a right hand in this frame
+			let leapRaycaster    = null;
+			let leapRaycastPlane = null;
+
+			// ──────────────────────────────────────────────────────────────────────────────
 
 			if ( WebGPU.isAvailable() === false ) {
 
@@ -108,16 +189,16 @@
 				setupParticles();
 
 				const gui = renderer.inspector.createParameters( 'Settings' );
-			
+
 				const numWorkgroups = Math.ceil( params.particleCount / workgroupSize );
 
 				p2g1KernelWorkgroupBuffer = new THREE.IndirectStorageBufferAttribute( new Uint32Array( [ numWorkgroups, 1, 1 ] ), 1 );
 				p2g2KernelWorkgroupBuffer = new THREE.IndirectStorageBufferAttribute( new Uint32Array( [ numWorkgroups, 1, 1 ] ), 1 );
-				g2pKernelWorkgroupBuffer = new THREE.IndirectStorageBufferAttribute( new Uint32Array( [ numWorkgroups, 1, 1 ] ), 1 );
+				g2pKernelWorkgroupBuffer  = new THREE.IndirectStorageBufferAttribute( new Uint32Array( [ numWorkgroups, 1, 1 ] ), 1 );
 
 				const p2g1WorkgroupStorage = storage( p2g1KernelWorkgroupBuffer, 'uint', 3 );
 				const p2g2WorkgroupStorage = storage( p2g2KernelWorkgroupBuffer, 'uint', 3 );
-				const g2pWorkgroupStorage = storage( g2pKernelWorkgroupBuffer, 'uint', 3 );
+				const g2pWorkgroupStorage  = storage( g2pKernelWorkgroupBuffer,  'uint', 3 );
 
 				workgroupKernel = Fn( () => {
 
@@ -138,6 +219,16 @@
 
 				window.addEventListener( 'resize', onWindowResize );
 				controls.update();
+
+				// /CAMBIO/ Initialize audio reactivity (graceful degradation on error)
+				await setupAudio();
+
+				// /CAMBIO/ Initialize Leap Motion (no-op if library is absent)
+				setupLeap();
+
+				// /CAMBIO/ Start the palette rotation timer (fires every 2 minutes)
+				startPaletteRotation();
+
 				renderer.setAnimationLoop( render );
 
 			}
@@ -147,14 +238,14 @@
 				const particleStruct = struct( {
 					position: { type: 'vec3' },
 					velocity: { type: 'vec3' },
-					C: { type: 'mat3' },
+					C:        { type: 'mat3' },
 				} );
-				const particleStructSize = 20; // each vec3 occupies 4 floats and mat3 occupies 12 floats in memory because of webgpu memory alignment
+				const particleStructSize = 20;
 				const particleArray = new Float32Array( maxParticles * particleStructSize );
 
 				for ( let i = 0; i < maxParticles; i ++ ) {
 
-					particleArray[ i * particleStructSize ] = ( Math.random() * 0.8 + 0.1 );
+					particleArray[ i * particleStructSize ]     = ( Math.random() * 0.8 + 0.1 );
 					particleArray[ i * particleStructSize + 1 ] = ( Math.random() * 0.8 + 0.1 );
 					particleArray[ i * particleStructSize + 2 ] = ( Math.random() * 0.8 + 0.1 );
 
@@ -165,55 +256,44 @@
 				const cellCount = gridSize.x * gridSize.y * gridSize.z;
 
 				const cellStruct = struct( {
-					x: { type: 'int', atomic: true },
-					y: { type: 'int', atomic: true },
-					z: { type: 'int', atomic: true },
+					x:    { type: 'int', atomic: true },
+					y:    { type: 'int', atomic: true },
+					z:    { type: 'int', atomic: true },
 					mass: { type: 'int', atomic: true },
 				} );
 
-				cellBuffer = instancedArray( cellCount, cellStruct );
+				cellBuffer      = instancedArray( cellCount, cellStruct );
 				cellBufferFloat = instancedArray( cellCount, 'vec4' );
 
 			}
 
 			function setupUniforms() {
 
-				gridSizeUniform = uniform( gridSize );
-				particleCountUniform = uniform( params.particleCount, 'uint' );
-				stiffnessUniform = uniform( 50 );
-				restDensityUniform = uniform( 1.5 );
-				dynamicViscosityUniform = uniform( 0.1 );
-				dtUniform = uniform( 1 / 60 );
-				gravityUniform = uniform( new THREE.Vector3( 0, - ( 9.81 * 9.81 ), 0 ) );
-				mouseRayOriginUniform = uniform( new THREE.Vector3( 0, 0, 0 ) );
-				mouseRayDirectionUniform = uniform( new THREE.Vector3( 0, 0, 0 ) );
-				mouseForceUniform = uniform( new THREE.Vector3( 0, 0, 0 ) );
-
-				// gui.add(restDensityUniform, "value", 1.0, 3, 0.1).name("restDensity");
-				// it's interesting to adjust the restDensity but it might cause the simulation to become unstable
+				gridSizeUniform           = uniform( gridSize );
+				particleCountUniform      = uniform( params.particleCount, 'uint' );
+				stiffnessUniform          = uniform( 50 );
+				restDensityUniform        = uniform( 1.5 );
+				dynamicViscosityUniform   = uniform( 0.1 );
+				dtUniform                 = uniform( 1 / 60 );
+				gravityUniform            = uniform( new THREE.Vector3( 0, - ( 9.81 * 9.81 ), 0 ) );
+				mouseRayOriginUniform     = uniform( new THREE.Vector3( 0, 0, 0 ) );
+				mouseRayDirectionUniform  = uniform( new THREE.Vector3( 0, 0, 0 ) );
+				mouseForceUniform         = uniform( new THREE.Vector3( 0, 0, 0 ) );
 
 			}
 
 			function setupComputeShaders() {
 
-				// the MLS-MPM system uses five compute shaders:
-				// 1. clearGridKernel: this clears the grid before each pass
-				// 2. p2g1Kernel & 3. p2g2Kernel: These particle2grid kernels transfer the particles' energy to the grid
-				// 4. updateGridKernel: updates the grid
-				// 5. g2pKernel: grid2particle kernel, transfers the grid energy back to the particles
-				// the implementation closely follows https://github.com/matsuoka-601/WebGPU-Ocean
-
-				// because webgpu only supports int atomics, we use fixed point floats by multiplying/dividing the float values with a high integer constant
 				const encodeFixedPoint = ( f32 ) => {
 
 					return int( f32.mul( fixedPointMultiplier ) );
-			
+
 				};
 
 				const decodeFixedPoint = ( i32 ) => {
 
 					return float( i32 ).div( fixedPointMultiplier );
-			
+
 				};
 
 				const cellCount = gridSize.x * gridSize.y * gridSize.z;
@@ -222,14 +302,14 @@
 					If( instanceIndex.greaterThanEqual( uint( cellCount ) ), () => {
 
 						Return();
-			
+
 					} );
 
-					atomicStore( cellBuffer.element( instanceIndex ).get( 'x' ), 0 );
-					atomicStore( cellBuffer.element( instanceIndex ).get( 'y' ), 0 );
-					atomicStore( cellBuffer.element( instanceIndex ).get( 'z' ), 0 );
+					atomicStore( cellBuffer.element( instanceIndex ).get( 'x' ),    0 );
+					atomicStore( cellBuffer.element( instanceIndex ).get( 'y' ),    0 );
+					atomicStore( cellBuffer.element( instanceIndex ).get( 'z' ),    0 );
 					atomicStore( cellBuffer.element( instanceIndex ).get( 'mass' ), 0 );
-			
+
 				} )().compute( cellCount ).setName( 'clearGridKernel' );
 
 				p2g1Kernel = Fn( () => {
@@ -237,15 +317,15 @@
 					If( instanceIndex.greaterThanEqual( particleCountUniform ), () => {
 
 						Return();
-			
+
 					} );
 					const particlePosition = particleBuffer.element( instanceIndex ).get( 'position' ).toConst( 'particlePosition' );
 					const particleVelocity = particleBuffer.element( instanceIndex ).get( 'velocity' ).toConst( 'particleVelocity' );
 					const C = particleBuffer.element( instanceIndex ).get( 'C' ).toConst( 'C' );
 
 					const gridPosition = particlePosition.mul( gridSizeUniform ).toVar();
-					const cellIndex = ivec3( gridPosition ).sub( 1 ).toConst( 'cellIndex' );
-					const cellDiff = gridPosition.fract().sub( 0.5 ).toConst( 'cellDiff' );
+					const cellIndex    = ivec3( gridPosition ).sub( 1 ).toConst( 'cellIndex' );
+					const cellDiff     = gridPosition.fract().sub( 0.5 ).toConst( 'cellDiff' );
 					const w0 = float( 0.5 ).mul( float( 0.5 ).sub( cellDiff ) ).mul( float( 0.5 ).sub( cellDiff ) );
 					const w1 = float( 0.75 ).sub( cellDiff.mul( cellDiff ) );
 					const w2 = float( 0.5 ).mul( float( 0.5 ).add( cellDiff ) ).mul( float( 0.5 ).add( cellDiff ) );
@@ -257,27 +337,27 @@
 
 							Loop( { start: 0, end: 3, type: 'int', name: 'gz', condition: '<' }, ( { gz } ) => {
 
-								const weight = weights.element( gx ).x.mul( weights.element( gy ).y ).mul( weights.element( gz ).z );
-								const cellX = cellIndex.add( ivec3( gx, gy, gz ) ).toConst();
+								const weight  = weights.element( gx ).x.mul( weights.element( gy ).y ).mul( weights.element( gz ).z );
+								const cellX   = cellIndex.add( ivec3( gx, gy, gz ) ).toConst();
 								const cellDist = vec3( cellX ).add( 0.5 ).sub( gridPosition ).toConst( 'cellDist' );
 								const Q = C.mul( cellDist );
 
-								const massContrib = weight; // assuming particle mass = 1.0
-								const velContrib = massContrib.mul( particleVelocity.add( Q ) ).toConst( 'velContrib' );
-								const cellPtr = cellX.x.mul( int( gridSize.y * gridSize.z ) ).add( cellX.y.mul( int( gridSize.z ) ) ).add( cellX.z ).toConst();
-								const cell = cellBuffer.element( cellPtr );
+								const massContrib = weight;
+								const velContrib  = massContrib.mul( particleVelocity.add( Q ) ).toConst( 'velContrib' );
+								const cellPtr     = cellX.x.mul( int( gridSize.y * gridSize.z ) ).add( cellX.y.mul( int( gridSize.z ) ) ).add( cellX.z ).toConst();
+								const cell        = cellBuffer.element( cellPtr );
 
-								atomicAdd( cell.get( 'x' ), encodeFixedPoint( velContrib.x ) );
-								atomicAdd( cell.get( 'y' ), encodeFixedPoint( velContrib.y ) );
-								atomicAdd( cell.get( 'z' ), encodeFixedPoint( velContrib.z ) );
+								atomicAdd( cell.get( 'x' ),    encodeFixedPoint( velContrib.x ) );
+								atomicAdd( cell.get( 'y' ),    encodeFixedPoint( velContrib.y ) );
+								atomicAdd( cell.get( 'z' ),    encodeFixedPoint( velContrib.z ) );
 								atomicAdd( cell.get( 'mass' ), encodeFixedPoint( massContrib ) );
-			
+
 							} );
-			
+
 						} );
-			
+
 					} );
-			
+
 				} )().compute( params.particleCount, [ workgroupSize, 1, 1 ] ).setName( 'p2g1Kernel' );
 
 				p2g2Kernel = Fn( () => {
@@ -285,13 +365,13 @@
 					If( instanceIndex.greaterThanEqual( particleCountUniform ), () => {
 
 						Return();
-			
+
 					} );
 					const particlePosition = particleBuffer.element( instanceIndex ).get( 'position' ).toConst( 'particlePosition' );
-					const gridPosition = particlePosition.mul( gridSizeUniform ).toVar();
+					const gridPosition     = particlePosition.mul( gridSizeUniform ).toVar();
 
 					const cellIndex = ivec3( gridPosition ).sub( 1 ).toConst( 'cellIndex' );
-					const cellDiff = gridPosition.fract().sub( 0.5 ).toConst( 'cellDiff' );
+					const cellDiff  = gridPosition.fract().sub( 0.5 ).toConst( 'cellDiff' );
 					const w0 = float( 0.5 ).mul( float( 0.5 ).sub( cellDiff ) ).mul( float( 0.5 ).sub( cellDiff ) );
 					const w1 = float( 0.75 ).sub( cellDiff.mul( cellDiff ) );
 					const w2 = float( 0.5 ).mul( float( 0.5 ).add( cellDiff ) ).mul( float( 0.5 ).add( cellDiff ) );
@@ -304,23 +384,23 @@
 
 							Loop( { start: 0, end: 3, type: 'int', name: 'gz', condition: '<' }, ( { gz } ) => {
 
-								const weight = weights.element( gx ).x.mul( weights.element( gy ).y ).mul( weights.element( gz ).z );
-								const cellX = cellIndex.add( ivec3( gx, gy, gz ) ).toConst();
+								const weight  = weights.element( gx ).x.mul( weights.element( gy ).y ).mul( weights.element( gz ).z );
+								const cellX   = cellIndex.add( ivec3( gx, gy, gz ) ).toConst();
 								const cellPtr = cellX.x.mul( int( gridSize.y * gridSize.z ) ).add( cellX.y.mul( int( gridSize.z ) ) ).add( cellX.z ).toConst();
-								const cell = cellBuffer.element( cellPtr );
-								const mass = decodeFixedPoint( atomicLoad( cell.get( 'mass' ) ) );
+								const cell    = cellBuffer.element( cellPtr );
+								const mass    = decodeFixedPoint( atomicLoad( cell.get( 'mass' ) ) );
 								density.addAssign( mass.mul( weight ) );
-			
+
 							} );
-			
+
 						} );
-			
+
 					} );
 
-					const volume = float( 1 ).div( density );
+					const volume   = float( 1 ).div( density );
 					const pressure = max( 0.0, pow( density.div( restDensityUniform ), 5.0 ).sub( 1 ).mul( stiffnessUniform ) ).toConst( 'pressure' );
-					const stress = mat3( pressure.negate(), 0, 0, 0, pressure.negate(), 0, 0, 0, pressure.negate() ).toVar( 'stress' );
-					const dudv = particleBuffer.element( instanceIndex ).get( 'C' ).toConst( 'C' );
+					const stress   = mat3( pressure.negate(), 0, 0, 0, pressure.negate(), 0, 0, 0, pressure.negate() ).toVar( 'stress' );
+					const dudv     = particleBuffer.element( instanceIndex ).get( 'C' ).toConst( 'C' );
 
 					const strain = dudv.add( dudv.transpose() );
 					stress.addAssign( strain.mul( dynamicViscosityUniform ) );
@@ -332,23 +412,23 @@
 
 							Loop( { start: 0, end: 3, type: 'int', name: 'gz', condition: '<' }, ( { gz } ) => {
 
-								const weight = weights.element( gx ).x.mul( weights.element( gy ).y ).mul( weights.element( gz ).z );
-								const cellX = cellIndex.add( ivec3( gx, gy, gz ) ).toConst();
+								const weight   = weights.element( gx ).x.mul( weights.element( gy ).y ).mul( weights.element( gz ).z );
+								const cellX    = cellIndex.add( ivec3( gx, gy, gz ) ).toConst();
 								const cellDist = vec3( cellX ).add( 0.5 ).sub( gridPosition ).toConst( 'cellDist' );
 								const momentum = eq16Term0.mul( weight ).mul( cellDist ).toConst( 'momentum' );
 
 								const cellPtr = cellX.x.mul( int( gridSize.y * gridSize.z ) ).add( cellX.y.mul( int( gridSize.z ) ) ).add( cellX.z ).toConst();
-								const cell = cellBuffer.element( cellPtr );
+								const cell    = cellBuffer.element( cellPtr );
 								atomicAdd( cell.get( 'x' ), encodeFixedPoint( momentum.x ) );
 								atomicAdd( cell.get( 'y' ), encodeFixedPoint( momentum.y ) );
 								atomicAdd( cell.get( 'z' ), encodeFixedPoint( momentum.z ) );
-			
+
 							} );
-			
+
 						} );
-			
+
 					} );
-			
+
 				} )().compute( params.particleCount, [ workgroupSize, 1, 1 ] ).setName( 'p2g2Kernel' );
 
 				updateGridKernel = Fn( () => {
@@ -356,7 +436,7 @@
 					If( instanceIndex.greaterThanEqual( uint( cellCount ) ), () => {
 
 						Return();
-			
+
 					} );
 					const cell = cellBuffer.element( instanceIndex );
 					const mass = decodeFixedPoint( atomicLoad( cell.get( 'mass' ) ) ).toConst();
@@ -390,24 +470,24 @@
 					} );
 
 					cellBufferFloat.element( instanceIndex ).assign( vec4( vx, vy, vz, mass ) );
-			
+
 				} )().compute( cellCount ).setName( 'updateGridKernel' );
 
 
 				const clampToRoundedBox = ( pos, box, radius ) => {
 
 					const result = pos.sub( 0.5 ).toVar();
-					const pp = step( box, result.abs() ).mul( result.add( box.negate().mul( result.sign() ) ) );
-					const ppLen = pp.length().toVar();
-					const dist = ppLen.sub( radius );
+					const pp     = step( box, result.abs() ).mul( result.add( box.negate().mul( result.sign() ) ) );
+					const ppLen  = pp.length().toVar();
+					const dist   = ppLen.sub( radius );
 					If( dist.greaterThan( 0.0 ), () => {
 
 						result.subAssign( pp.normalize().mul( dist ).mul( 1.3 ) );
-			
+
 					} );
 					result.addAssign( 0.5 );
 					return result;
-			
+
 				};
 
 				g2pKernel = Fn( () => {
@@ -415,14 +495,14 @@
 					If( instanceIndex.greaterThanEqual( particleCountUniform ), () => {
 
 						Return();
-			
+
 					} );
 					const particlePosition = particleBuffer.element( instanceIndex ).get( 'position' ).toVar( 'particlePosition' );
-					const gridPosition = particlePosition.mul( gridSizeUniform ).toVar();
+					const gridPosition     = particlePosition.mul( gridSizeUniform ).toVar();
 					const particleVelocity = vec3( 0 ).toVar();
 
 					const cellIndex = ivec3( gridPosition ).sub( 1 ).toConst( 'cellIndex' );
-					const cellDiff = gridPosition.fract().sub( 0.5 ).toConst( 'cellDiff' );
+					const cellDiff  = gridPosition.fract().sub( 0.5 ).toConst( 'cellDiff' );
 
 					const w0 = float( 0.5 ).mul( float( 0.5 ).sub( cellDiff ) ).mul( float( 0.5 ).sub( cellDiff ) );
 					const w1 = float( 0.75 ).sub( cellDiff.mul( cellDiff ) );
@@ -436,10 +516,10 @@
 
 							Loop( { start: 0, end: 3, type: 'int', name: 'gz', condition: '<' }, ( { gz } ) => {
 
-								const weight = weights.element( gx ).x.mul( weights.element( gy ).y ).mul( weights.element( gz ).z );
-								const cellX = cellIndex.add( ivec3( gx, gy, gz ) ).toConst();
-								const cellDist = vec3( cellX ).add( 0.5 ).sub( gridPosition ).toConst( 'cellDist' );
-								const cellPtr = cellX.x.mul( int( gridSize.y * gridSize.z ) ).add( cellX.y.mul( int( gridSize.z ) ) ).add( cellX.z ).toConst();
+								const weight           = weights.element( gx ).x.mul( weights.element( gy ).y ).mul( weights.element( gz ).z );
+								const cellX            = cellIndex.add( ivec3( gx, gy, gz ) ).toConst();
+								const cellDist         = vec3( cellX ).add( 0.5 ).sub( gridPosition ).toConst( 'cellDist' );
+								const cellPtr          = cellX.x.mul( int( gridSize.y * gridSize.z ) ).add( cellX.y.mul( int( gridSize.z ) ) ).add( cellX.z ).toConst();
 
 								const weightedVelocity = cellBufferFloat.element( cellPtr ).xyz.mul( weight ).toConst( 'weightedVelocity' );
 								const term = mat3(
@@ -449,11 +529,11 @@
 								);
 								B.addAssign( term );
 								particleVelocity.addAssign( weightedVelocity );
-			
+
 							} );
-			
+
 						} );
-			
+
 					} );
 
 					particleBuffer.element( instanceIndex ).get( 'C' ).assign( B.mul( 4 ) );
@@ -465,7 +545,7 @@
 					particleVelocity.divAssign( gridSizeUniform );
 
 					// mouseInteraction
-					const dist = cross( mouseRayDirectionUniform, particlePosition.sub( mouseRayOriginUniform ) ).length();
+					const dist  = cross( mouseRayDirectionUniform, particlePosition.sub( mouseRayOriginUniform ) ).length();
 					const force = dist.mul( 3.00 ).oneMinus().max( 0.0 ).pow( 2 );
 					particleVelocity.addAssign( mouseForceUniform.mul( force ) );
 
@@ -476,27 +556,18 @@
 					particlePosition.assign( clamp( particlePosition, vec3( 1 ).div( gridSizeUniform ), vec3( gridSize ).sub( 1 ).div( gridSizeUniform ) ) );
 
 					// add force for particles to stay within rounded box
-					const innerBox = gridSizeUniform.mul( 0.5 ).sub( 9.0 ).div( gridSizeUniform ).toVar();
+					const innerBox    = gridSizeUniform.mul( 0.5 ).sub( 9.0 ).div( gridSizeUniform ).toVar();
 					const innerRadius = float( 6.0 ).div( gridSizeUniform.x );
-					const posNext = particlePosition.add( particleVelocity.mul( dtUniform ).mul( 2.0 ) ).toConst( 'posNext' );
-					const posNextClamped = clampToRoundedBox( posNext, innerBox, innerRadius );
+					const posNext         = particlePosition.add( particleVelocity.mul( dtUniform ).mul( 2.0 ) ).toConst( 'posNext' );
+					const posNextClamped  = clampToRoundedBox( posNext, innerBox, innerRadius );
 					particleVelocity.addAssign( posNextClamped.sub( posNext ) );
 
-					/*
-					const wallStiffness = 1.0;
-					const xN = particlePosition.add( particleVelocity.mul( dtUniform ).mul( 2.0 ) ).toConst( 'xN' );
-					const wallMin = vec3( 3 ).div(gridSizeUniform).toConst( 'wallMin' );
-					const wallMax = vec3( gridSize ).sub( 3 ).div(gridSizeUniform).toConst( 'wallMax' );
-					particleVelocity.addAssign( wallMin.sub( xN ).max( 0.0 ).mul( wallStiffness ) );
-					particleVelocity.addAssign( wallMax.sub( xN ).min( 0.0 ).mul( wallStiffness ) );
-					*/
-
-					// scale from (1, 1, 1) back to (gridSize.x, gridSize.y, gridSize.z) to
+					// scale from (1, 1, 1) back to (gridSize.x, gridSize.y, gridSize.z)
 					particleVelocity.mulAssign( gridSizeUniform );
 
 					particleBuffer.element( instanceIndex ).get( 'position' ).assign( particlePosition );
 					particleBuffer.element( instanceIndex ).get( 'velocity' ).assign( particleVelocity );
-			
+
 				} )().compute( params.particleCount, [ workgroupSize, 1, 1 ] ).setName( 'g2pKernel' );
 
 			}
@@ -506,16 +577,43 @@
 				// mergeVertices to reduce the number of vertexShaderCalls
 				const geometry = BufferGeometryUtils.mergeVertices( new THREE.IcosahedronGeometry( 0.008, 1 ).deleteAttribute( 'uv' ) );
 
-				const material = new THREE.MeshStandardNodeMaterial( {
-					color: '#0066FF'
-				} );
+				const material = new THREE.MeshStandardNodeMaterial();
 
+				// /CAMBIO/ Create one vec3 uniform per group – values are updated from JS on bass hits and palette rotation
+				colorGroup0 = uniform( new THREE.Vector3( 1.0, 0.2, 0.4 ) ); // default: warm red-pink
+				colorGroup1 = uniform( new THREE.Vector3( 0.0, 0.6, 1.0 ) ); // default: sky blue
+				colorGroup2 = uniform( new THREE.Vector3( 1.0, 0.8, 0.0 ) ); // default: golden yellow
+				colorGroup3 = uniform( new THREE.Vector3( 0.0, 1.0, 0.6 ) ); // default: mint green
+
+				groupColorUniforms = [ colorGroup0, colorGroup1, colorGroup2, colorGroup3 ];
+
+				// /CAMBIO/ Apply initial palette values to the uniforms
+				updateGroupColors();
+
+				// /CAMBIO/ colorNode: select per-group color based on instanceIndex % 4
+				// Four independent If blocks – exactly one will be true per instance (g ∈ {0,1,2,3})
+				material.colorNode = Fn( () => {
+
+					const g   = instanceIndex.mod( uint( 4 ) );
+					const col = vec3( 0.0, 0.0, 0.0 ).toVar();
+
+					If( g.equal( uint( 0 ) ), () => { col.assign( colorGroup0 ); } );
+					If( g.equal( uint( 1 ) ), () => { col.assign( colorGroup1 ); } );
+					If( g.equal( uint( 2 ) ), () => { col.assign( colorGroup2 ); } );
+					If( g.equal( uint( 3 ) ), () => { col.assign( colorGroup3 ); } );
+
+					return col;
+
+				} )();
+
+				// /CAMBIO/ positionNode unchanged from original
 				material.positionNode = Fn( () => {
 
 					const particlePosition = particleBuffer.element( instanceIndex ).get( 'position' );
 					return attribute( 'position' ).add( particlePosition );
-			
+
 				} )();
+
 				particleMesh = new THREE.Mesh( geometry, material );
 				particleMesh.count = params.particleCount;
 				particleMesh.position.set( - 0.5, 0, - 0.5 );
@@ -524,14 +622,36 @@
 
 			}
 
+			// /CAMBIO/ Update all four group color uniforms from the current palette/state
+			function updateGroupColors() {
+
+				for ( let i = 0; i < 4; i ++ ) {
+
+					const palette     = colorPalettes[ groupPaletteIndex[ i ] % colorPalettes.length ];
+					const activeColor = groupActiveColor[ i ] === 0 ? palette.colorA : palette.colorB;
+
+					// uniform.value is a THREE.Vector3; THREE.Color.r/g/b are in [0,1] linear range
+					groupColorUniforms[ i ].value.set( activeColor.r, activeColor.g, activeColor.b );
+
+				}
+
+			}
+
+			// /CAMBIO/ Mouse setup – ignores pointer events when a Leap right hand is visible
 			function setupMouse() {
 
-				const raycaster = new THREE.Raycaster();
-				const raycastPlane = new THREE.Plane( new THREE.Vector3( 0, 1, 0 ) );
+				const raycaster     = new THREE.Raycaster();
+				const raycastPlane  = new THREE.Plane( new THREE.Vector3( 0, 1, 0 ) );
 
 				const onMove = ( event ) => {
 
-					const pointer = new THREE.Vector2( ( event.clientX / window.innerWidth ) * 2 - 1, - ( event.clientY / window.innerHeight ) * 2 + 1 );
+					// /CAMBIO/ Yield control to Leap Motion when a right hand is detected
+					if ( leapHandVisible ) return;
+
+					const pointer = new THREE.Vector2(
+						(  event.clientX / window.innerWidth  ) * 2 - 1,
+						- ( event.clientY / window.innerHeight ) * 2 + 1
+					);
 					raycaster.setFromCamera( pointer, camera );
 					raycaster.ray.origin.x += 0.5;
 					raycaster.ray.origin.z += 0.5;
@@ -556,12 +676,210 @@
 
 			}
 
+			// ─── /CAMBIO/ Audio setup ──────────────────────────────────────────────────────
+			// Requests microphone access; gracefully degrades if unavailable or denied.
+			async function setupAudio() {
+
+				if ( ! navigator.mediaDevices || ! navigator.mediaDevices.getUserMedia ) {
+					console.warn( '[Audio] getUserMedia not supported in this browser.' );
+					return;
+				}
+
+				try {
+
+					const stream = await navigator.mediaDevices.getUserMedia( { audio: true, video: false } );
+
+					audioContext = new ( window.AudioContext || window.webkitAudioContext )();
+					const source = audioContext.createMediaStreamSource( stream );
+
+					analyser = audioContext.createAnalyser();
+					analyser.fftSize = 256;                  // 128 frequency bins
+					analyser.smoothingTimeConstant = 0.8;    // built-in smoothing inside analyser
+
+					source.connect( analyser );
+					audioDataArray = new Uint8Array( analyser.frequencyBinCount );
+
+					console.log( '[Audio] Microphone ready. Bins:', analyser.frequencyBinCount );
+
+				} catch ( err ) {
+
+					// User denied permission or no mic present – experience continues without audio reactivity
+					console.warn( '[Audio] Microphone unavailable:', err.message );
+					audioContext  = null;
+					analyser      = null;
+					audioDataArray = null;
+
+				}
+
+			}
+
+			// /CAMBIO/ Called every render frame – reads bass energy and triggers color toggle
+			function processAudio() {
+
+				if ( ! analyser || ! audioDataArray ) return;
+
+				analyser.getByteFrequencyData( audioDataArray );
+
+				// Bass range: bins 0-4 (~0-860 Hz for a 44100 Hz / 256 FFT setup, ~172 Hz per bin)
+				let bassSum = 0;
+				const BASS_BINS = 5;
+				for ( let i = 0; i < BASS_BINS; i ++ ) {
+					bassSum += audioDataArray[ i ];
+				}
+				const rawBass = bassSum / BASS_BINS;
+
+				// /CAMBIO/ Exponential moving average to remove erratic spikes
+				smoothedBass = smoothedBass * BASS_SMOOTH + rawBass * ( 1 - BASS_SMOOTH );
+
+				const bassNowActive = smoothedBass > BASS_THRESHOLD;
+
+				// /CAMBIO/ Trigger only on rising edge to prevent rapid flickering
+				if ( bassNowActive && ! bassWasActive ) {
+
+					for ( let i = 0; i < 4; i ++ ) {
+						groupActiveColor[ i ] = groupActiveColor[ i ] === 0 ? 1 : 0;
+					}
+					updateGroupColors();
+
+				}
+
+				bassWasActive = bassNowActive;
+
+			}
+
+			// ─── /CAMBIO/ Palette rotation ─────────────────────────────────────────────────
+			// Every 2 minutes each group picks a new ColorTupla.
+			// We avoid giving two groups the same tupla wherever possible.
+			function startPaletteRotation() {
+
+				setInterval( () => {
+
+					const usedIndices = [];
+
+					for ( let i = 0; i < 4; i ++ ) {
+
+						// Build candidate list: all palette indices except the current one and already used ones
+						const candidates = [];
+						for ( let p = 0; p < colorPalettes.length; p ++ ) {
+							if ( p !== groupPaletteIndex[ i ] && ! usedIndices.includes( p ) ) {
+								candidates.push( p );
+							}
+						}
+
+						// Fall back to any unused index if ideal candidates are exhausted
+						const pool = candidates.length > 0
+							? candidates
+							: colorPalettes.map( ( _, idx ) => idx ).filter( p => ! usedIndices.includes( p ) );
+
+						const chosen = pool.length > 0
+							? pool[ Math.floor( Math.random() * pool.length ) ]
+							: ( groupPaletteIndex[ i ] + 1 ) % colorPalettes.length;
+
+						groupPaletteIndex[ i ] = chosen;
+						usedIndices.push( chosen );
+
+					}
+
+					updateGroupColors();
+					console.log( '[PaletteRotation] New palette indices:', groupPaletteIndex.slice() );
+
+				}, 2 * 60 * 1000 ); // 2 minutes
+
+			}
+
+			// ─── /CAMBIO/ Leap Motion setup ────────────────────────────────────────────────
+			// Follows the exact same integration pattern used in /ninja-uribe/js/game.js.
+			// Uses the same leap-1.1.1.js library (copied from that project).
+			// Only the RIGHT hand controls the particle simulation.
+			// Falls back silently if Leap is not connected or not present.
+			function setupLeap() {
+
+				// Guard: Leap library must be available as a global (loaded via the non-module <script> tag)
+				if ( ! window.Leap ) {
+					console.warn( '[Leap] Library not found. Particle control via Leap is disabled.' );
+					return;
+				}
+
+				// /CAMBIO/ Dedicated raycaster and plane for Leap – mirrors the mouse setup in setupMouse()
+				leapRaycaster    = new THREE.Raycaster();
+				leapRaycastPlane = new THREE.Plane( new THREE.Vector3( 0, 1, 0 ) );
+
+				// /CAMBIO/ Create controller following ninja-uribe pattern
+				leapController = new Leap.Controller( { enableGestures: true } );
+				leapController.connect();
+
+				// /CAMBIO/ Frame event – identical logic to InputManager.initLeap() in ninja-uribe
+				leapController.on( 'frame', ( frame ) => {
+
+					if ( frame.hands.length === 0 ) {
+						leapHandVisible = false;
+						return;
+					}
+
+					// /CAMBIO/ Only respond to the RIGHT hand – matches the design requirement
+					const rightHand = frame.hands.find( h => h.type === 'right' );
+					if ( ! rightHand ) {
+						leapHandVisible = false;
+						return;
+					}
+
+					leapHandVisible = true;
+
+					const palmPos        = rightHand.palmPosition; // [x, y, z] in mm
+					const interactionBox = frame.interactionBox;
+
+					let normalizedX, normalizedY;
+
+					if ( interactionBox && interactionBox.normalizePoint ) {
+
+						// /CAMBIO/ Standard normalization – identical to ninja-uribe InputManager
+						const normalized = interactionBox.normalizePoint( palmPos, true );
+						normalizedX = normalized[ 0 ]; // 0 = left edge,   1 = right edge
+						normalizedY = normalized[ 1 ]; // 0 = bottom edge, 1 = top edge
+
+					} else {
+
+						// /CAMBIO/ Manual fallback – identical to ninja-uribe InputManager fallback
+						// Typical Leap range: X (-200 to +200 mm), Y (100 to 400 mm)
+						normalizedX = Math.max( 0, Math.min( 1, ( palmPos[ 0 ] + 200 ) / 400 ) );
+						normalizedY = Math.max( 0, Math.min( 1, ( palmPos[ 1 ] - 100 ) / 300 ) );
+
+					}
+
+					// /CAMBIO/ Convert [0,1] normalized coords to NDC pointer space [-1, +1]
+					// Leap Y is up-positive, which matches NDC (no inversion needed)
+					const pointer = new THREE.Vector2(
+						normalizedX * 2 - 1,
+						normalizedY * 2 - 1
+					);
+
+					// /CAMBIO/ Update the shared raycaster state – same fields used by the mouse path
+					leapRaycaster.setFromCamera( pointer, camera );
+					leapRaycaster.ray.origin.x += 0.5;
+					leapRaycaster.ray.origin.z += 0.5;
+					mouseRayOriginUniform.value.copy( leapRaycaster.ray.origin );
+					mouseRayDirectionUniform.value.copy( leapRaycaster.ray.direction );
+
+					leapRaycaster.ray.intersectPlane( leapRaycastPlane, mouseCoord );
+
+				} );
+
+				leapController.on( 'deviceStreaming', () => {
+					console.log( '[Leap] Device streaming – right hand controls particles.' );
+				} );
+
+				leapController.on( 'deviceStopped', () => {
+					console.log( '[Leap] Device disconnected – falling back to mouse.' );
+					leapHandVisible = false;
+				} );
+
+			}
+
+			// /CAMBIO/ onWindowResize – handles camera aspect ratio and renderer size (unchanged logic, verified correct)
 			function onWindowResize() {
 
 				camera.aspect = window.innerWidth / window.innerHeight;
-
 				camera.updateProjectionMatrix();
-
 				renderer.setSize( window.innerWidth, window.innerHeight );
 
 			}
@@ -570,22 +888,24 @@
 
 				timer.update();
 
-				const deltaTime = THREE.MathUtils.clamp( timer.getDelta(), 0.00001, 1 / 60 ); // don't advance the time too far, for example when the window is out of focus
+				const deltaTime = THREE.MathUtils.clamp( timer.getDelta(), 0.00001, 1 / 60 );
 				dtUniform.value = deltaTime;
+
+				// /CAMBIO/ Process audio every frame – updates color uniforms on bass events
+				processAudio();
 
 				mouseForceUniform.value.copy( mouseCoord ).sub( prevMouseCoord ).multiplyScalar( 2 );
 				const mouseForceLength = mouseForceUniform.value.length();
 				if ( mouseForceLength > 0.3 ) {
 
 					mouseForceUniform.value.multiplyScalar( 0.3 / mouseForceLength );
-			
+
 				}
 
 				prevMouseCoord.copy( mouseCoord );
 
 				renderer.compute( workgroupKernel );
 
-				//renderer.compute( [ clearGridKernel, p2g1Kernel, p2g2Kernel, updateGridKernel, g2pKernel ] );
 				renderer.compute( clearGridKernel );
 				renderer.compute( p2g1Kernel, p2g1KernelWorkgroupBuffer );
 				renderer.compute( p2g2Kernel, p2g2KernelWorkgroupBuffer );

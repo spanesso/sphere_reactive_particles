@@ -126,6 +126,12 @@
 			let colorGroup0, colorGroup1, colorGroup2, colorGroup3;
 			let groupColorUniforms = [];   // populated in setupMesh()
 
+			// /CAMBIO/ Smooth color lerp state – current interpolated color per group
+			// Separate from groupActiveColor (binary 0/1 target) so transitions are gradual
+			const groupCurrentColors = [ new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color() ];
+			const groupTargetColors  = [ new THREE.Color(), new THREE.Color(), new THREE.Color(), new THREE.Color() ];
+			const COLOR_LERP_SPEED   = 0.04; // fraction per frame (≈2–3 s to complete at 60 fps)
+
 			// ─── /CAMBIO/ Audio reactive variables ────────────────────────────────────────
 			let audioContext = null;
 			let analyser    = null;
@@ -140,6 +146,9 @@
 			let leapHandVisible  = false;  // true while Leap detects a right hand in this frame
 			let leapRaycaster    = null;
 			let leapRaycastPlane = null;
+			// /CAMBIO/ Smoothed NDC pointer for Leap – prevents jitter from raw palm data
+			const leapSmoothedPointer = new THREE.Vector2( 0, 0 );
+			const LEAP_LERP_SPEED     = 0.2; // fraction per frame (higher = more responsive, less smooth)
 
 			// ──────────────────────────────────────────────────────────────────────────────
 
@@ -164,6 +173,8 @@
 				renderer.toneMapping = THREE.ACESFilmicToneMapping;
 				renderer.toneMappingExposure = 1.35;
 				renderer.inspector = new Inspector();
+				// /CAMBIO/ Fondo negro real – sin este llamado el clear por defecto es gris
+				renderer.setClearColor( 0x000000, 1 );
 				document.body.appendChild( renderer.domElement );
 
 				scene = new THREE.Scene();
@@ -182,8 +193,8 @@
 
 				const hdrTexture = await hdrLoader.loadAsync( 'royal_esplanade_2k.hdr.jpg' );
 				hdrTexture.mapping = THREE.EquirectangularReflectionMapping;
-				scene.background = hdrTexture;
-				scene.backgroundBlurriness = 0.5;
+				// /CAMBIO/ No asignamos scene.background – mantenemos el fondo negro del renderer.
+				// scene.environment se conserva para que el IBL siga iluminando las partículas.
 				scene.environment = hdrTexture;
 
 				setupParticles();
@@ -587,8 +598,10 @@
 
 				groupColorUniforms = [ colorGroup0, colorGroup1, colorGroup2, colorGroup3 ];
 
-				// /CAMBIO/ Apply initial palette values to the uniforms
+				// /CAMBIO/ Set initial targets and seed current colors to the same value
+				// so the lerp starts at the correct color (no fade-in from black).
 				updateGroupColors();
+				for ( let i = 0; i < 4; i ++ ) groupCurrentColors[ i ].copy( groupTargetColors[ i ] );
 
 				// /CAMBIO/ colorNode: select per-group color based on instanceIndex % 4
 				// Four independent If blocks – exactly one will be true per instance (g ∈ {0,1,2,3})
@@ -622,16 +635,33 @@
 
 			}
 
-			// /CAMBIO/ Update all four group color uniforms from the current palette/state
+			// /CAMBIO/ Update all four group TARGET colors from the current palette/state.
+			// Does NOT write to uniforms directly – lerpGroupColors() handles that each frame.
 			function updateGroupColors() {
 
 				for ( let i = 0; i < 4; i ++ ) {
 
 					const palette     = colorPalettes[ groupPaletteIndex[ i ] % colorPalettes.length ];
 					const activeColor = groupActiveColor[ i ] === 0 ? palette.colorA : palette.colorB;
+					groupTargetColors[ i ].copy( activeColor );
 
-					// uniform.value is a THREE.Vector3; THREE.Color.r/g/b are in [0,1] linear range
-					groupColorUniforms[ i ].value.set( activeColor.r, activeColor.g, activeColor.b );
+				}
+
+			}
+
+			// /CAMBIO/ Called every render frame – smoothly lerps current colors toward targets
+			// and writes the result to the GPU uniforms.  Decoupled from event triggers so
+			// transitions are always gradual regardless of how targets change.
+			function lerpGroupColors() {
+
+				for ( let i = 0; i < 4; i ++ ) {
+
+					groupCurrentColors[ i ].lerp( groupTargetColors[ i ], COLOR_LERP_SPEED );
+					groupColorUniforms[ i ].value.set(
+						groupCurrentColors[ i ].r,
+						groupCurrentColors[ i ].g,
+						groupCurrentColors[ i ].b
+					);
 
 				}
 
@@ -848,13 +878,16 @@
 
 					// /CAMBIO/ Convert [0,1] normalized coords to NDC pointer space [-1, +1]
 					// Leap Y is up-positive, which matches NDC (no inversion needed)
-					const pointer = new THREE.Vector2(
+					const rawPointer = new THREE.Vector2(
 						normalizedX * 2 - 1,
 						normalizedY * 2 - 1
 					);
 
+					// /CAMBIO/ Lerp toward raw pointer to smooth out per-frame palm jitter
+					leapSmoothedPointer.lerp( rawPointer, LEAP_LERP_SPEED );
+
 					// /CAMBIO/ Update the shared raycaster state – same fields used by the mouse path
-					leapRaycaster.setFromCamera( pointer, camera );
+					leapRaycaster.setFromCamera( leapSmoothedPointer, camera );
 					leapRaycaster.ray.origin.x += 0.5;
 					leapRaycaster.ray.origin.z += 0.5;
 					mouseRayOriginUniform.value.copy( leapRaycaster.ray.origin );
@@ -891,8 +924,10 @@
 				const deltaTime = THREE.MathUtils.clamp( timer.getDelta(), 0.00001, 1 / 60 );
 				dtUniform.value = deltaTime;
 
-				// /CAMBIO/ Process audio every frame – updates color uniforms on bass events
+				// /CAMBIO/ Process audio every frame – sets target colors on bass events
 				processAudio();
+				// /CAMBIO/ Smoothly lerp current colors toward targets each frame
+				lerpGroupColors();
 
 				mouseForceUniform.value.copy( mouseCoord ).sub( prevMouseCoord ).multiplyScalar( 2 );
 				const mouseForceLength = mouseForceUniform.value.length();
